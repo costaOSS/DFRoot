@@ -20,8 +20,19 @@ A: Sorry, there is no fix. Either:
 
 If the ESP path is fixed but another page-cache bug is still open, see
 [docs/CVES.md](docs/CVES.md). The exploit can switch to CopyFail
-(CVE-2026-31431) or Dirty Pipe (CVE-2022-0847) with `--primitive`, and
-`--probe` reports which one this kernel and sandbox actually allow.
+(CVE-2026-31431), Dirty COW (CVE-2016-5195, kernel 4.x and older) or
+Dirty Pipe (CVE-2022-0847) with `--primitive`, and `--probe` reports
+which one this kernel and sandbox actually allow.
+
+**Q: Does this work on kernel 4.x?**
+
+A: The page-cache side does: `auto` picks Dirty COW on any kernel before
+4.8.3 / 4.7.9 / 4.4.26. The kernel module does not carry over, because
+4.x Android kernels are vendor kernels with their own `vermagic` and
+module CRCs, and DFRoot only ships prebuilt KOs for GKI 5.10+. On 4.x the
+KO has to be rebuilt from that device's kernel tree, and KernelSU has to
+be built into the kernel rather than loaded as a module. Details and the
+4.x CVE table are in [docs/CVES.md](docs/CVES.md).
 
 **Q: Log says "SUCCESS" or "ksud exited with error", but I don't have root**
 

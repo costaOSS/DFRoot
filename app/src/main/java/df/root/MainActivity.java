@@ -136,11 +136,12 @@ public class MainActivity extends Activity implements IReporter {
     }
 
     private void showPrimitiveDialog() {
-        final String[] keys = { "auto", "xfrm", "copyfail", "dirtypipe" };
+        final String[] keys = { "auto", "xfrm", "copyfail", "dirtycow", "dirtypipe" };
         final String[] labels = {
                 "auto — page-cache first, ESP fallback",
                 "xfrm — CVE-2026-43284 (needs IpSecManager)",
                 "copyfail — CVE-2026-31431 (needs AF_ALG)",
+                "dirtycow — CVE-2016-5195 (kernel 4.x and older)",
                 "dirtypipe — CVE-2022-0847 (kernel 5.8-5.16)",
         };
         SharedPreferences prefs = mDeCtx.getSharedPreferences(

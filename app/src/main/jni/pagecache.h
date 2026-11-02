@@ -20,6 +20,7 @@ enum pcw_prim {
     PCW_XFRM = 0,   /* CVE-2026-43284 DirtyFrag, existing path */
     PCW_COPYFAIL,   /* CVE-2026-31431 CopyFail */
     PCW_DIRTYPIPE,  /* CVE-2022-0847 Dirty Pipe */
+    PCW_DIRTYCOW,   /* CVE-2016-5195 Dirty COW, kernel 4.x and older */
     PCW_PRIM_MAX,
 };
 
@@ -30,11 +31,13 @@ const char *pcw_prim_cve(int prim);
  * Probes are read-only: they create a socket or read uname, never write. */
 int pcw_copyfail_probe(void);
 int pcw_dirtypipe_probe(void);
+int pcw_dirtycow_probe(void);
 
 /* Write len bytes into the page cache backing fd at off.
  * fd may be O_RDONLY. Returns 0 only after a pread() of the range matches. */
 int pcw_copyfail_write_fd(int fd, off_t off, const void *data, size_t len);
 int pcw_dirtypipe_write_fd(int fd, off_t off, const void *data, size_t len);
+int pcw_dirtycow_write_fd(int fd, off_t off, const void *data, size_t len);
 
 /* Release cached AF_ALG state. Safe to call more than once. */
 void pcw_copyfail_close(void);

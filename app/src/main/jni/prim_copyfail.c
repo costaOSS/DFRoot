@@ -212,6 +212,7 @@ const char *pcw_prim_name(int prim)
     case PCW_XFRM:      return "xfrm";
     case PCW_COPYFAIL:  return "copyfail";
     case PCW_DIRTYPIPE: return "dirtypipe";
+    case PCW_DIRTYCOW:  return "dirtycow";
     default:            return "none";
     }
 }
@@ -222,6 +223,7 @@ const char *pcw_prim_cve(int prim)
     case PCW_XFRM:      return "CVE-2026-43284";
     case PCW_COPYFAIL:  return "CVE-2026-31431";
     case PCW_DIRTYPIPE: return "CVE-2022-0847";
+    case PCW_DIRTYCOW:  return "CVE-2016-5195";
     default:            return "none";
     }
 }

