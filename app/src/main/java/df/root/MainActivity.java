@@ -1,6 +1,7 @@
 package df.root;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -123,11 +124,40 @@ public class MainActivity extends Activity implements IReporter {
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == R.id.action_primitive) {
+            showPrimitiveDialog();
+            return true;
+        }
         if (item.getItemId() == R.id.action_settings) {
             startActivity(new Intent(this, SettingsActivity.class));
             return true;
         }
         return super.onOptionsItemSelected(item);
+    }
+
+    private void showPrimitiveDialog() {
+        final String[] keys = { "auto", "xfrm", "copyfail", "dirtypipe" };
+        final String[] labels = {
+                "auto — page-cache first, ESP fallback",
+                "xfrm — CVE-2026-43284 (needs IpSecManager)",
+                "copyfail — CVE-2026-31431 (needs AF_ALG)",
+                "dirtypipe — CVE-2022-0847 (kernel 5.8-5.16)",
+        };
+        SharedPreferences prefs = mDeCtx.getSharedPreferences(
+                ExploitRunner.PREFS_NAME, Context.MODE_PRIVATE);
+        String cur = prefs.getString(ExploitRunner.PREF_PRIMITIVE, ExploitRunner.PRIM_AUTO);
+        int checked = 0;
+        for (int i = 0; i < keys.length; i++) if (keys[i].equals(cur)) checked = i;
+
+        new AlertDialog.Builder(this)
+                .setTitle("Page-cache primitive")
+                .setSingleChoiceItems(labels, checked, (d, which) -> {
+                    prefs.edit().putString(ExploitRunner.PREF_PRIMITIVE, keys[which]).apply();
+                    Toast.makeText(this, "primitive: " + keys[which], Toast.LENGTH_SHORT).show();
+                    d.dismiss();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private void updateRunButton() {

@@ -18,6 +18,11 @@ A: Sorry, there is no fix. Either:
   - Your device manufacturer backported the official mitigation
   - [Accidental mitigation](https://github.com/V4bel/dirtyfrag/issues/23#issuecomment-4405314290) (typically seen on kernel 6.1)
 
+If the ESP path is fixed but another page-cache bug is still open, see
+[docs/CVES.md](docs/CVES.md). The exploit can switch to CopyFail
+(CVE-2026-31431) or Dirty Pipe (CVE-2022-0847) with `--primitive`, and
+`--probe` reports which one this kernel and sandbox actually allow.
+
 **Q: Log says "SUCCESS" or "ksud exited with error", but I don't have root**
 
 A: First, try disabling "Auto Soft Reboot" in DFRoot settings if you have it enabled, otherwise https://github.com/diabl0w/DFRoot/discussions/69

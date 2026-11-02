@@ -3,11 +3,16 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 // argv[0] = program name
 // argv[1] = file offset (decimal string)
 // argv[2] = file path
 // argv[3] = optional "r" — read mode: write 16 bytes of file content to fd 0 (OUT_FD)
+//           "h" — handoff mode: send the opened file descriptor to the parent
+//                 over fd 1 (SCM_RIGHTS), so the caller can splice the page
+//                 itself; the clone has no CLONE_FILES, so this is the only
+//                 way the descriptor crosses the process boundary
 //           if absent — splice mode: splice 16 bytes of file page into fd 1 (PIPE_FD)
 
 #define OUT_FD  0
@@ -70,6 +75,35 @@ void start_c(void *argblock) {
             mysyscall1(3, __NR_exit_group);
         long w = mysyscall3(OUT_FD, (unsigned long)buf, 16, __NR_write);
         mysyscall1((unsigned long)(w == 16 ? 0 : 2), __NR_exit_group);
+    }
+
+    if (mode && streq(mode, "h")) {
+        /* Exit code 0 = descriptor sent, 4 = sendmsg failed */
+        struct msghdr msg;
+        union {
+            struct cmsghdr align;
+            char buf[CMSG_SPACE(sizeof(int))];
+        } cbuf;
+        unsigned char *z;
+        unsigned long i;
+        struct cmsghdr *cm;
+
+        z = (unsigned char *)&msg;
+        for (i = 0; i < sizeof(msg); i++) z[i] = 0;
+        z = (unsigned char *)&cbuf;
+        for (i = 0; i < sizeof(cbuf); i++) z[i] = 0;
+
+        msg.msg_control = cbuf.buf;
+        msg.msg_controllen = sizeof(cbuf.buf);
+
+        cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type  = SCM_RIGHTS;
+        cm->cmsg_len   = CMSG_LEN(sizeof(int));
+        *(int *)CMSG_DATA(cm) = file_fd;
+
+        long r = mysyscall3(PIPE_FD, (unsigned long)&msg, 0, __NR_sendmsg);
+        mysyscall1((unsigned long)(r >= 0 ? 0 : 4), __NR_exit_group);
     }
 
     /* Splice mode: splice 16-byte page into PIPE_FD */
